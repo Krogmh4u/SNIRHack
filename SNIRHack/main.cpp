@@ -1,121 +1,133 @@
 #include <iostream>
-#include <winternl.h>
-#include <Windows.h>
-#include <tchar.h>
-#include <TlHelp32.h>
+#include <string>
+#include <vector>
+#include <sstream>
 
-typedef LONG NTSTATUS;
-typedef DWORD KPRIORITY;
-typedef WORD UWORD;
+#include <windows.h>
 
-typedef struct _CLIENT_ID
-{
-    PVOID UniqueProcess;
-    PVOID UniqueThread;
-} CLIENT_ID, * PCLIENT_ID;
+// list all PIDs and TIDs
+#include <tlhelp32.h>
+#include <Psapi.h>
 
-typedef struct _THREAD_BASIC_INFORMATION
-{
-    NTSTATUS                ExitStatus;
-    PVOID                   TebBaseAddress;
-    CLIENT_ID               ClientId;
-    KAFFINITY               AffinityMask;
-    KPRIORITY               Priority;
-    KPRIORITY               BasePriority;
-} THREAD_BASIC_INFORMATION, * PTHREAD_BASIC_INFORMATION;
+#include "ntinfo.h"
 
-enum THREADINFOCLASS
-{
-    ThreadBasicInformation,
-};
+std::vector<DWORD> threadList(DWORD pid);
+DWORD GetThreadStartAddress(HANDLE processHandle, HANDLE hThread);
+DWORD FindProcessId(DWORD &pId);
 
-void* GetThreadStackTopAddress(HANDLE hProcess, HANDLE hThread)
-{
-    bool loadedManually = false;
-    HMODULE module = GetModuleHandle(L"ntdll.dll");
+int main() {
+	DWORD dwProcID;
 
-    if (!module)
-    {
-        module = LoadLibrary(L"ntdll.dll");
-        loadedManually = true;
-    }
+	if (!FindProcessId(dwProcID)) {
+		std::cerr << "Process ID couldn\'t be found." << std::endl;
+		return EXIT_FAILURE;
+	}
 
-    NTSTATUS(__stdcall * NtQueryInformationThread)(HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength, PULONG ReturnLength);
-    NtQueryInformationThread = reinterpret_cast<decltype(NtQueryInformationThread)>(GetProcAddress(module, "NtQueryInformationThread"));
+	HANDLE hProcHandle = NULL;
 
-    if (NtQueryInformationThread)
-    {
-        NT_TIB tib = { 0 };
-        THREAD_BASIC_INFORMATION tbi = { 0 };
+	printf("PID %d (0x%x)\n", dwProcID, dwProcID);
+	std::cout << "Grabbing handle" << std::endl;
+	hProcHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwProcID);
 
-        NTSTATUS status = NtQueryInformationThread(hThread, ThreadBasicInformation, &tbi, sizeof(tbi), nullptr);
-        if (status >= 0)
-        {
-            ReadProcessMemory(hProcess, tbi.TebBaseAddress, &tib, sizeof(tbi), nullptr);
+	if (hProcHandle == INVALID_HANDLE_VALUE || hProcHandle == NULL) {
+		std::cerr << "Failed to open process -- invalid handle" << std::endl;
+		std::cerr << "Error code: " << GetLastError() << std::endl;
+		return EXIT_FAILURE;
+	}
+	else {
+		std::cout << "Success" << std::endl;
+	}
 
-            if (loadedManually)
-            {
-                FreeLibrary(module);
-            }
-            return tib.StackBase;
-        }
-    }
+	std::vector<DWORD> threadId = threadList(dwProcID);
+	int stackNum = 0;
+	for (auto it = threadId.begin(); it != threadId.end(); ++it) {
+		HANDLE threadHandle = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, *it);
+		DWORD threadStartAddress = GetThreadStartAddress(hProcHandle, threadHandle);
+		printf("TID: 0x%04x = THREADSTACK%2d BASE ADDRESS: 0x%04x\n", *it, stackNum, threadStartAddress);
+		stackNum++;
+	}
 
-
-    if (loadedManually)
-    {
-        FreeLibrary(module);
-    }
-
-    return nullptr;
+	return EXIT_SUCCESS;
 }
 
-DWORD FindProcessId(const std::wstring& processName)
-{
-    PROCESSENTRY32 processInfo;
-    processInfo.dwSize = sizeof(processInfo);
+std::vector<DWORD> threadList(DWORD pid) {
+	std::vector<DWORD> vect = std::vector<DWORD>();
+	HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (h == INVALID_HANDLE_VALUE)
+		return vect;
 
-    HANDLE processesSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
-    if (processesSnapshot == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
+	THREADENTRY32 te;
+	te.dwSize = sizeof(te);
+	if (Thread32First(h, &te)) {
+		do {
+			if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+				sizeof(te.th32OwnerProcessID)) {
 
-    Process32First(processesSnapshot, &processInfo);
-    if (!processName.compare(processInfo.szExeFile))
-    {
-        CloseHandle(processesSnapshot);
-        return processInfo.th32ProcessID;
-    }
 
-    while (Process32Next(processesSnapshot, &processInfo))
-    {
-        if (!processName.compare(processInfo.szExeFile))
-        {
-            CloseHandle(processesSnapshot);
-            return processInfo.th32ProcessID;
-        }
-    }
+				if (te.th32OwnerProcessID == pid) {
+					printf("PID: %04d Thread ID: 0x%04x\n", te.th32OwnerProcessID, te.th32ThreadID);
+					vect.push_back(te.th32ThreadID);
+				}
 
-    CloseHandle(processesSnapshot);
-    return 0;
+			}
+			te.dwSize = sizeof(te);
+		} while (Thread32Next(h, &te));
+	}
+
+	return vect;
 }
-int main()
+
+DWORD GetThreadStartAddress(HANDLE processHandle, HANDLE hThread) {
+	DWORD used = 0, ret = 0;
+	DWORD stacktop = 0, result = 0;
+
+	MODULEINFO mi;
+
+	GetModuleInformation(processHandle, GetModuleHandle("kernel32.dll"), &mi, sizeof(mi));
+	stacktop = (DWORD)GetThreadStackTopAddress_x86(processHandle, hThread);
+
+	CloseHandle(hThread);
+
+	if (stacktop) {
+
+		DWORD* buf32 = new DWORD[4096];
+
+		if (ReadProcessMemory(processHandle, (LPCVOID)(stacktop - 4096), buf32, 4096, NULL)) {
+			for (int i = 4096 / 4 - 1; i >= 0; --i) {
+				if (buf32[i] >= (DWORD)mi.lpBaseOfDll && buf32[i] <= (DWORD)mi.lpBaseOfDll + mi.SizeOfImage) {
+					result = stacktop - 4096 + i * 4;
+					break;
+				}
+
+			}
+		}
+
+		delete buf32;
+	}
+
+	return result;
+}
+
+DWORD FindProcessId(DWORD& pId)
 {
-    DWORD ProcId = FindProcessId(L"Projet_SNIR.exe");
-    if (!ProcId) {
-        std::cerr << "[-] Process ID can\'t be found." << std::endl;
-        exit(-1);
-    }
+	PROCESSENTRY32 entry;
+	entry.dwSize = sizeof(PROCESSENTRY32);
 
-    std::cout << "[+] Target process ID : " << std::hex << ProcId << std::endl;
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, NULL, ProcId);
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
 
-    if (!hProcess) {
-        std::cerr << "[-] Error obtaining game handle." << std::endl;
-        exit(-1);
-    }
+	if (Process32First(snapshot, &entry) == TRUE)
+	{
+		while (Process32Next(snapshot, &entry) == TRUE)
+		{
+			if (_stricmp(entry.szExeFile, "Projet_SNIR.exe") == 0)
+			{
+				pId = entry.th32ProcessID;
+				return entry.th32ProcessID;
+			}
+		}
+	}
 
-    std::cout << "[+] Target Handle Opened : " << std::hex << hProcess << std::endl;
+	CloseHandle(snapshot);
 
-    return 0;
+	return 0;
 }
